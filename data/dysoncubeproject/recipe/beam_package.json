@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "G": "dysoncubeproject:beam",
+    "I": "#c:storage_blocks/copper"
+  },
+  "pattern": [
+    " G ",
+    "GIG",
+    " G "
+  ],
+  "result": {
+    "count": 1,
+    "id": "dysoncubeproject:beam_package"
+  }
+}

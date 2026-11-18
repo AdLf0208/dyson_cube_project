@@ -1,0 +1,11 @@
+{
+  "title": "itemGroup.dyson_cube_project",
+  "icon": "dysoncubeproject:ray_receiver_controller",
+  "items": [
+    "dysoncubeproject:ray_receiver_controller",
+    "dysoncubeproject:beam",
+    "dysoncubeproject:beam_package",
+    "dysoncubeproject:solar_sail",
+    "dysoncubeproject:solar_sail_package"
+  ]
+}

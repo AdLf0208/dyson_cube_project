@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "G": "dysoncubeproject:solar_sail",
+    "I": "#c:storage_blocks/iron"
+  },
+  "pattern": [
+    "GGG",
+    "GIG",
+    "GGG"
+  ],
+  "result": {
+    "count": 1,
+    "id": "dysoncubeproject:solar_sail_package"
+  }
+}
