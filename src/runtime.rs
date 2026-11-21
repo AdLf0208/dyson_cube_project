@@ -1,9 +1,11 @@
-// Pure model of the Dyson Cube Project ray receiver (slice 1).
+// Pure model of the Dyson Cube Project ray receiver and its shared sphere (slices 1–2).
 //
 // This file is both the standalone Cargo library and the injected
 // `crate::game::dysoncubeproject` module. Every number comes from the mod's own
 // `Config.java`, and every rule from the class named beside it; `FINDINGS.md`
 // records the file each one was read from.
+
+use std::collections::BTreeMap;
 
 /// The multiblock's footprint, from `RayReceiverControllerBlock.MULTIBLOCK_STRUCTURE`
 /// (`new MultiblockStructure(3, 6, 3, SHAPE)`).
@@ -219,6 +221,102 @@ impl Sphere {
     }
 }
 
+/// The level's spheres, as `DysonSphereProgressSavedData` keeps them: one map of
+/// spheres by id, and one of the players subscribed to a sphere. Upstream's saved
+/// data lives once per level; here it is the level's `SPHERES` attachment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Spheres {
+    /// `spheres`: the sphere id to its progress and reservoir.
+    pub spheres: BTreeMap<String, Sphere>,
+    /// `subscribedPlayers`: a player's UUID to the sphere they subscribed to.
+    pub subscribed: BTreeMap<String, String>,
+}
+
+impl Spheres {
+    /// No spheres and no subscriptions.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `getSubscribedFor`: the sphere this player reads, their own UUID when they
+    /// subscribed to none.
+    #[must_use]
+    pub fn sphere_for(&self, player: &str) -> String {
+        self.subscribed
+            .get(player)
+            .cloned()
+            .unwrap_or_else(|| player.to_owned())
+    }
+
+    /// `getSpheres().computeIfAbsent(...)` plus a subscription: a controller's
+    /// `setPlacedBy` creates the sphere it will feed and remembers the player is on it.
+    pub fn subscribe(&mut self, player: &str, sphere: &str) {
+        self.spheres.entry(sphere.to_owned()).or_default();
+        self.subscribed.insert(player.to_owned(), sphere.to_owned());
+    }
+
+    /// The sphere with this id, when one exists.
+    #[must_use]
+    pub fn sphere(&self, id: &str) -> Option<&Sphere> {
+        self.spheres.get(id)
+    }
+
+    /// The sphere with this id, created empty when absent (`computeIfAbsent`).
+    pub fn sphere_mut(&mut self, id: &str) -> &mut Sphere {
+        self.spheres.entry(id.to_owned()).or_default()
+    }
+
+    /// `DysonCubeProject`'s level tick: every sphere refills its reservoir once.
+    pub fn generate(&mut self) {
+        for sphere in self.spheres.values_mut() {
+            sphere.generate_power();
+        }
+    }
+
+    /// `DysonSphereStructure.extractPower` on one sphere.
+    pub fn extract(&mut self, id: &str, amount: i32) -> i32 {
+        self.sphere_mut(id).extract_power(amount)
+    }
+
+    /// `/dysoncubeproject set beams <sphere> <value>`, clamped to the sphere's ceiling.
+    pub fn set_beams(&mut self, id: &str, value: i32) -> i32 {
+        self.sphere_mut(id).set_beams(value)
+    }
+
+    /// `/dysoncubeproject set panels <sphere> <value>`, clamped to what its beams support.
+    pub fn set_panels(&mut self, id: &str, value: i32) -> i32 {
+        self.sphere_mut(id).set_solar_panels(value)
+    }
+
+    /// `/dysoncubeproject add beams <sphere> <delta>`, clamped the same way.
+    pub fn add_beams(&mut self, id: &str, delta: i32) -> i32 {
+        self.sphere_mut(id).add_beams(delta)
+    }
+
+    /// `/dysoncubeproject add panels <sphere> <delta>`, clamped the same way.
+    pub fn add_panels(&mut self, id: &str, delta: i32) -> i32 {
+        self.sphere_mut(id).add_solar_panels(delta)
+    }
+}
+
+/// Java's `UUID.toString()` for the `u128` (`PlayerRef::uuid`) a sphere is keyed by:
+/// eight, four, four, four and twelve lowercase hex digits. It is the string upstream's
+/// saved data keys a sphere by (`player.getStringUUID()`).
+#[must_use]
+pub fn uuid_text(value: u128) -> String {
+    let high = (value >> 64) as u64;
+    let low = value as u64;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        high >> 32,
+        (high >> 16) & 0xffff,
+        high & 0xffff,
+        low >> 48,
+        low & 0x0000_ffff_ffff_ffff
+    )
+}
+
 /// The world facts the receiver's tick reads: `Level.isDay`, `Level.isRaining`,
 /// `Level.canSeeSky(pos.above())` and the dimension generation runs in.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -314,32 +412,17 @@ impl Buffer {
     }
 }
 
-/// What one tick of a receiver did, for the readout.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Harvest {
-    /// What the sphere made this tick (`sails * POWER_PER_SAIL`).
-    pub generated: i32,
-    /// What moved from the sphere into the buffer.
-    pub extracted: i32,
-}
-
-/// `RayReceiverBlockEntity.serverTick` without the world: the sphere generates,
-/// then the receiver pulls what its buffer has room for when the sky allows.
-pub fn tick(buffer: &mut Buffer, sphere: &mut Sphere, sky: Sky) -> Harvest {
-    if !sky.overworld {
-        return Harvest::default();
+/// `RayReceiverBlockEntity.serverTick`'s pull, without the world: what the buffer
+/// takes from the sphere when the sky allows. Generation is not here — upstream runs
+/// it once per level tick for every sphere (`Spheres::generate`), not per receiver, or
+/// two receivers on one sphere would double its output.
+pub fn harvest(buffer: &mut Buffer, sphere: &mut Sphere, sky: Sky) -> i32 {
+    if !sky.harvests() {
+        return 0;
     }
-    sphere.generate_power();
-    let generated = sphere.generation_per_tick();
-    let mut extracted = 0;
-    if sky.harvests() {
-        extracted = sphere.extract_power(RAY_RECEIVER_EXTRACT_POWER.min(buffer.room()));
-        buffer.insert(extracted);
-    }
-    Harvest {
-        generated,
-        extracted,
-    }
+    let took = sphere.extract_power(RAY_RECEIVER_EXTRACT_POWER.min(buffer.room()));
+    buffer.insert(took);
+    took
 }
 
 /// What `/dysoncubeproject set|add` changes.
@@ -349,27 +432,32 @@ pub enum Stat {
     Panels,
 }
 
-/// One `/dysoncubeproject` command, parsed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Command {
-    Status {
-        pos: [i32; 3],
-    },
+/// One `/dysoncubeproject` line, parsed into what it does to a sphere.
+///
+/// Not named `Command`: the SDK exports a `Command` type, and a local type of the same
+/// name makes `cargo horizon-mod fits --build <other>` resolve the wrong one (it then
+/// reports the API's `Command` as built with a literal).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SphereOp {
+    /// Our own readout of a controller: upstream's GUI addon as a line.
+    Status { pos: [i32; 3] },
+    /// `set beams|panels <sphere> <value>`.
     Set {
         stat: Stat,
-        pos: [i32; 3],
+        sphere: String,
         value: i32,
     },
+    /// `add beams|panels <sphere> <delta>`.
     Add {
         stat: Stat,
-        pos: [i32; 3],
+        sphere: String,
         value: i32,
     },
 }
 
 /// Why a line is not a command of this mod's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandError {
+pub enum LineError {
     /// Another command: the mod leaves it alone.
     NotOurs,
     /// Ours, but not one of its forms.
@@ -378,22 +466,22 @@ pub enum CommandError {
 
 /// What a refused command answers with (upstream has no usage line).
 pub const USAGE: &str =
-    "Usage: /dysoncubeproject status <x> <y> <z>, set|add beams|panels <x> <y> <z> <value>";
+    "Usage: /dysoncubeproject status <x> <y> <z>, set|add beams|panels <sphere> <value>";
 
-pub fn parse_command(words: &[&str]) -> Result<Command, CommandError> {
+pub fn parse_command(words: &[&str]) -> Result<SphereOp, LineError> {
     let Some((head, rest)) = words.split_first() else {
-        return Err(CommandError::NotOurs);
+        return Err(LineError::NotOurs);
     };
     if *head != "dysoncubeproject" {
-        return Err(CommandError::NotOurs);
+        return Err(LineError::NotOurs);
     }
     match rest {
-        ["status", x, y, z] => Ok(Command::Status {
+        ["status", x, y, z] => Ok(SphereOp::Status {
             pos: parse_pos([*x, *y, *z])?,
         }),
-        ["set", stat, x, y, z, value] => change(Change::Set, stat, [x, y, z], value),
-        ["add", stat, x, y, z, value] => change(Change::Add, stat, [x, y, z], value),
-        _ => Err(CommandError::BadUsage),
+        ["set", stat, sphere, value] => change(Change::Set, stat, sphere, value),
+        ["add", stat, sphere, value] => change(Change::Add, stat, sphere, value),
+        _ => Err(LineError::BadUsage),
     }
 }
 
@@ -404,30 +492,35 @@ enum Change {
     Add,
 }
 
-fn parse_pos([x, y, z]: [&str; 3]) -> Result<[i32; 3], CommandError> {
+fn parse_pos([x, y, z]: [&str; 3]) -> Result<[i32; 3], LineError> {
     Ok([
-        x.parse().map_err(|_| CommandError::BadUsage)?,
-        y.parse().map_err(|_| CommandError::BadUsage)?,
-        z.parse().map_err(|_| CommandError::BadUsage)?,
+        x.parse().map_err(|_| LineError::BadUsage)?,
+        y.parse().map_err(|_| LineError::BadUsage)?,
+        z.parse().map_err(|_| LineError::BadUsage)?,
     ])
 }
 
-fn change(
-    change: Change,
-    stat: &str,
-    pos: [&str; 3],
-    value: &str,
-) -> Result<Command, CommandError> {
+fn change(change: Change, stat: &str, sphere: &str, value: &str) -> Result<SphereOp, LineError> {
     let stat = match stat {
         "beams" => Stat::Beams,
         "panels" => Stat::Panels,
-        _ => return Err(CommandError::BadUsage),
+        _ => return Err(LineError::BadUsage),
     };
-    let value: i32 = value.parse().map_err(|_| CommandError::BadUsage)?;
-    let pos = parse_pos(pos)?;
+    if sphere.is_empty() {
+        return Err(LineError::BadUsage);
+    }
+    let value: i32 = value.parse().map_err(|_| LineError::BadUsage)?;
     Ok(match change {
-        Change::Set => Command::Set { stat, pos, value },
-        Change::Add => Command::Add { stat, pos, value },
+        Change::Set => SphereOp::Set {
+            stat,
+            sphere: sphere.to_owned(),
+            value,
+        },
+        Change::Add => SphereOp::Add {
+            stat,
+            sphere: sphere.to_owned(),
+            value,
+        },
     })
 }
 
@@ -730,82 +823,225 @@ mod tests {
 
     #[test]
     fn a_hundred_sails_fill_the_buffer_at_two_thousand_a_tick() {
-        let mut sphere = Sphere::new();
-        sphere.set_beams(17);
-        sphere.set_solar_panels(100);
+        let mut spheres = Spheres::new();
+        let id = "10000000-0000-0000-0000-000000000001";
+        spheres.set_beams(id, 17);
+        spheres.set_panels(id, 100);
         let mut buffer = Buffer::default();
         for _ in 0..100 {
-            let harvest = tick(&mut buffer, &mut sphere, noon());
-            assert_eq!(harvest.generated, 2_000);
-            assert_eq!(harvest.extracted, 2_000);
+            spheres.generate();
+            let sphere = spheres.sphere_mut(id);
+            assert_eq!(harvest(&mut buffer, sphere, noon()), 2_000);
         }
         assert_eq!(buffer.energy, 200_000);
     }
 
     #[test]
     fn the_extraction_rate_caps_at_fifty_million() {
-        let mut sphere = Sphere::new();
-        sphere.set_beams(sphere.max_beams());
-        sphere.set_solar_panels(MAX_SOLAR_PANELS);
+        let mut spheres = Spheres::new();
+        let id = "sponge";
+        spheres.set_beams(id, Sphere::new().max_beams());
+        spheres.set_panels(id, MAX_SOLAR_PANELS);
         let mut buffer = Buffer::default();
-        let harvest = tick(&mut buffer, &mut sphere, noon());
-        assert_eq!(harvest.generated, 1_000_000_000);
-        assert_eq!(harvest.extracted, RAY_RECEIVER_EXTRACT_POWER);
+        spheres.generate();
+        let sphere = spheres.sphere_mut(id);
+        assert_eq!(
+            harvest(&mut buffer, sphere, noon()),
+            RAY_RECEIVER_EXTRACT_POWER
+        );
         assert_eq!(buffer.energy, 50_000_000);
+        assert_eq!(
+            sphere.stored_power, 950_000_000,
+            "the rest waits in the reservoir"
+        );
     }
 
     #[test]
     fn the_buffer_stops_at_its_capacity() {
-        let mut sphere = Sphere::new();
-        sphere.set_beams(sphere.max_beams());
-        sphere.set_solar_panels(MAX_SOLAR_PANELS);
+        let mut spheres = Spheres::new();
+        let id = "sponge";
+        spheres.set_beams(id, Sphere::new().max_beams());
+        spheres.set_panels(id, MAX_SOLAR_PANELS);
         let mut buffer = Buffer::default();
         for _ in 0..3 {
-            tick(&mut buffer, &mut sphere, noon());
+            spheres.generate();
+            harvest(&mut buffer, spheres.sphere_mut(id), noon());
         }
         assert_eq!(buffer.energy, RAY_RECEIVER_POWER_BUFFER);
-        let harvest = tick(&mut buffer, &mut sphere, noon());
-        assert_eq!(harvest.extracted, 0, "a full buffer takes nothing");
+        assert_eq!(
+            harvest(&mut buffer, spheres.sphere_mut(id), noon()),
+            0,
+            "a full buffer takes nothing"
+        );
         assert_eq!(buffer.energy, RAY_RECEIVER_POWER_BUFFER);
     }
 
     #[test]
-    fn night_still_generates_but_fills_nothing() {
-        let mut sphere = Sphere::new();
-        sphere.set_beams(1);
-        sphere.set_solar_panels(6);
+    fn night_generates_but_a_receiver_fills_nothing() {
+        let mut spheres = Spheres::new();
+        let id = "night";
+        spheres.set_beams(id, 1);
+        spheres.set_panels(id, 6);
+        spheres.generate();
+        assert_eq!(
+            spheres.sphere(id).expect("the sphere exists").stored_power,
+            120,
+            "upstream generates at night too"
+        );
         let mut buffer = Buffer::default();
         let mut sky = noon();
         sky.day_time = 18_000;
-        let harvest = tick(&mut buffer, &mut sphere, sky);
-        assert_eq!(harvest.generated, 120, "upstream generates at night too");
-        assert_eq!(harvest.extracted, 0);
+        assert_eq!(harvest(&mut buffer, spheres.sphere_mut(id), sky), 0);
         assert_eq!(buffer.energy, 0);
-        assert_eq!(sphere.stored_power, 120);
+        assert_eq!(
+            spheres.sphere(id).expect("the sphere exists").stored_power,
+            120
+        );
     }
 
     #[test]
-    fn the_nether_and_the_end_generate_nothing() {
-        let mut sphere = Sphere::new();
-        sphere.set_beams(sphere.max_beams());
-        sphere.set_solar_panels(MAX_SOLAR_PANELS);
+    fn a_fixed_time_level_harvests_nothing() {
+        let mut spheres = Spheres::new();
+        let id = "nether";
+        spheres.set_beams(id, Sphere::new().max_beams());
+        spheres.set_panels(id, MAX_SOLAR_PANELS);
+        spheres.generate();
         let mut buffer = Buffer::default();
         let mut sky = noon();
         sky.overworld = false;
-        let harvest = tick(&mut buffer, &mut sphere, sky);
-        assert_eq!(harvest, Harvest::default());
-        assert_eq!(sphere.stored_power, 0);
+        assert_eq!(harvest(&mut buffer, spheres.sphere_mut(id), sky), 0);
         assert_eq!(buffer.energy, 0);
     }
 
     #[test]
     fn an_empty_sphere_makes_nothing() {
-        let mut sphere = Sphere::new();
+        let mut spheres = Spheres::new();
         let mut buffer = Buffer::default();
-        let harvest = tick(&mut buffer, &mut sphere, noon());
-        assert_eq!(harvest.generated, 0);
-        assert_eq!(harvest.extracted, 0);
+        spheres.generate();
+        assert_eq!(harvest(&mut buffer, spheres.sphere_mut("empty"), noon()), 0);
         assert_eq!(buffer.energy, 0);
+    }
+
+    #[test]
+    fn harvesting_pulls_without_generating() {
+        // With the sphere shared, generation is the level tick's job: a receiver that
+        // also generated would multiply the sphere's output by its receiver count.
+        let mut sphere = Sphere::new();
+        sphere.set_beams(17);
+        sphere.set_solar_panels(100);
+        let mut buffer = Buffer::default();
+        assert_eq!(
+            harvest(&mut buffer, &mut sphere, noon()),
+            0,
+            "nothing stored yet"
+        );
+        assert_eq!(sphere.stored_power, 0);
+        sphere.generate_power();
+        assert_eq!(harvest(&mut buffer, &mut sphere, noon()), 2_000);
+        assert_eq!(buffer.energy, 2_000);
+    }
+
+    #[test]
+    fn a_players_sphere_is_their_own_uuid_until_they_subscribe() {
+        let mut spheres = Spheres::new();
+        let player = "10000000-0000-0000-0000-0000000000aa";
+        assert_eq!(spheres.sphere_for(player), player);
+        spheres.subscribe(player, "shared-sphere");
+        assert_eq!(spheres.sphere_for(player), "shared-sphere");
+        assert_eq!(spheres.sphere_for("someone-else"), "someone-else");
+    }
+
+    #[test]
+    fn subscribing_creates_one_sphere_and_remembers_it() {
+        let mut spheres = Spheres::new();
+        let player = "10000000-0000-0000-0000-0000000000aa";
+        spheres.subscribe(player, "shared-sphere");
+        assert_eq!(spheres.sphere("shared-sphere"), Some(&Sphere::new()));
+        spheres.set_panels("shared-sphere", 0);
+        spheres.subscribe(player, "shared-sphere");
+        assert_eq!(
+            spheres.spheres.len(),
+            1,
+            "subscribing again keeps the one sphere"
+        );
+        assert_eq!(spheres.subscribed.len(), 1);
+    }
+
+    #[test]
+    fn two_receivers_draw_from_one_reservoir() {
+        let mut spheres = Spheres::new();
+        let id = "shared-sphere";
+        spheres.set_beams(id, 17);
+        spheres.set_panels(id, 100);
+        spheres.generate();
+        let mut first = Buffer::default();
+        let mut second = Buffer::default();
+        // One tick's reservoir is 2,000 FE and the first receiver pulls it all, as two
+        // receivers on one sphere do upstream.
+        assert_eq!(harvest(&mut first, spheres.sphere_mut(id), noon()), 2_000);
+        assert_eq!(harvest(&mut second, spheres.sphere_mut(id), noon()), 0);
+        assert_eq!(first.energy, 2_000);
+        assert_eq!(second.energy, 0);
+        assert_eq!(
+            spheres
+                .sphere(id)
+                .expect("the sphere exists")
+                .last_consumed_power,
+            2_000,
+            "the shared reservoir records one tick of consumption"
+        );
+        // The next level tick refills it and the second receiver takes that tick.
+        spheres.generate();
+        assert_eq!(harvest(&mut second, spheres.sphere_mut(id), noon()), 2_000);
+        assert_eq!(first.energy, 2_000, "the first was full of this tick");
+    }
+
+    #[test]
+    fn spheres_are_independent_of_each_other() {
+        let mut spheres = Spheres::new();
+        spheres.set_beams("a", 10);
+        spheres.set_panels("a", 60);
+        spheres.set_beams("b", 1);
+        assert_eq!(spheres.sphere("b").expect("b exists").solar_panels, 0);
+        spheres.add_panels("a", 1);
+        assert_eq!(spheres.sphere("a").expect("a exists").solar_panels, 60);
+        assert_eq!(spheres.sphere("b").expect("b exists").solar_panels, 0);
+    }
+
+    #[test]
+    fn every_sphere_generates_once_per_level_tick() {
+        let mut spheres = Spheres::new();
+        for (id, beams) in [("a", 1), ("b", 2), ("empty", 0)] {
+            spheres.set_beams(id, beams);
+        }
+        spheres.set_panels("a", 6);
+        spheres.set_panels("b", 12);
+        spheres.generate();
+        assert_eq!(spheres.sphere("a").expect("a").stored_power, 120);
+        assert_eq!(spheres.sphere("b").expect("b").stored_power, 240);
+        assert_eq!(spheres.sphere("empty").expect("empty").stored_power, 0);
+    }
+
+    #[test]
+    fn the_store_sets_and_adds_by_id_with_the_ceilings() {
+        let mut spheres = Spheres::new();
+        assert_eq!(spheres.set_beams("new", 17), 17, "an unknown id is created");
+        assert_eq!(spheres.set_panels("new", 100), 100);
+        assert_eq!(spheres.set_panels("new", -1), 0);
+        assert_eq!(spheres.add_beams("new", -100), 0);
+        assert_eq!(spheres.add_beams("new", i32::MAX), 8_333_334);
+        assert_eq!(spheres.set_beams("new", i32::MAX), 8_333_334);
+        assert_eq!(spheres.set_panels("new", i32::MAX), MAX_SOLAR_PANELS);
+    }
+
+    #[test]
+    fn a_uuid_reads_as_java_prints_it() {
+        assert_eq!(
+            uuid_text(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
+        assert_eq!(uuid_text(0), "00000000-0000-0000-0000-000000000000");
+        assert_eq!(uuid_text(u128::MAX), "ffffffff-ffff-ffff-ffff-ffffffffffff");
     }
 
     #[test]
@@ -834,50 +1070,42 @@ mod tests {
     fn status_parses_with_signed_coordinates() {
         assert_eq!(
             parse_command(&["dysoncubeproject", "status", "-3", "140", "12"]),
-            Ok(Command::Status { pos: [-3, 140, 12] })
+            Ok(SphereOp::Status { pos: [-3, 140, 12] })
         );
     }
 
     #[test]
-    fn set_and_add_parse_each_stat() {
-        let at = [100, 140, 0];
+    fn set_and_add_parse_each_stat_by_sphere() {
+        let sphere = "01234567-89ab-cdef-0123-456789abcdef";
         assert_eq!(
-            parse_command(&["dysoncubeproject", "set", "beams", "100", "140", "0", "17"]),
-            Ok(Command::Set {
+            parse_command(&["dysoncubeproject", "set", "beams", sphere, "17"]),
+            Ok(SphereOp::Set {
                 stat: Stat::Beams,
-                pos: at,
+                sphere: sphere.to_owned(),
                 value: 17
             })
         );
         assert_eq!(
-            parse_command(&[
-                "dysoncubeproject",
-                "set",
-                "panels",
-                "100",
-                "140",
-                "0",
-                "100"
-            ]),
-            Ok(Command::Set {
+            parse_command(&["dysoncubeproject", "set", "panels", sphere, "100"]),
+            Ok(SphereOp::Set {
                 stat: Stat::Panels,
-                pos: at,
+                sphere: sphere.to_owned(),
                 value: 100
             })
         );
         assert_eq!(
-            parse_command(&["dysoncubeproject", "add", "beams", "100", "140", "0", "-1"]),
-            Ok(Command::Add {
+            parse_command(&["dysoncubeproject", "add", "beams", sphere, "-1"]),
+            Ok(SphereOp::Add {
                 stat: Stat::Beams,
-                pos: at,
+                sphere: sphere.to_owned(),
                 value: -1
             })
         );
         assert_eq!(
-            parse_command(&["dysoncubeproject", "add", "panels", "100", "140", "0", "6"]),
-            Ok(Command::Add {
+            parse_command(&["dysoncubeproject", "add", "panels", sphere, "6"]),
+            Ok(SphereOp::Add {
                 stat: Stat::Panels,
-                pos: at,
+                sphere: sphere.to_owned(),
                 value: 6
             })
         );
@@ -887,9 +1115,9 @@ mod tests {
     fn another_command_is_left_alone() {
         assert_eq!(
             parse_command(&["bigreactors", "status", "0", "0", "0"]),
-            Err(CommandError::NotOurs)
+            Err(LineError::NotOurs)
         );
-        assert_eq!(parse_command(&[]), Err(CommandError::NotOurs));
+        assert_eq!(parse_command(&[]), Err(LineError::NotOurs));
     }
 
     #[test]
@@ -898,16 +1126,12 @@ mod tests {
             vec!["dysoncubeproject"],
             vec!["dysoncubeproject", "status"],
             vec!["dysoncubeproject", "status", "1", "2"],
-            vec!["dysoncubeproject", "set", "beams", "1", "2", "3"],
-            vec!["dysoncubeproject", "set", "sails", "1", "2", "3", "4"],
-            vec!["dysoncubeproject", "add", "beams", "1", "2", "3", "many"],
+            vec!["dysoncubeproject", "set", "beams", "1"],
+            vec!["dysoncubeproject", "set", "sails", "sphere", "4"],
+            vec!["dysoncubeproject", "add", "beams", "sphere", "many"],
             vec!["dysoncubeproject", "status", "1", "2", "x"],
         ] {
-            assert_eq!(
-                parse_command(&words),
-                Err(CommandError::BadUsage),
-                "{words:?}"
-            );
+            assert_eq!(parse_command(&words), Err(LineError::BadUsage), "{words:?}");
         }
     }
 
@@ -915,7 +1139,11 @@ mod tests {
     fn a_trailing_word_is_a_usage_error() {
         assert_eq!(
             parse_command(&["dysoncubeproject", "status", "1", "2", "3", "4"]),
-            Err(CommandError::BadUsage)
+            Err(LineError::BadUsage)
+        );
+        assert_eq!(
+            parse_command(&["dysoncubeproject", "set", "beams", "a", "1", "2"]),
+            Err(LineError::BadUsage)
         );
     }
 

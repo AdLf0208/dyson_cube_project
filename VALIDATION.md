@@ -149,7 +149,9 @@ slot guard; the ladder itself is `cargo`'s, because there is no staging step any
 (root: `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`,
 `uses.json`; `src/` ×3; `assets/` ×29; `data/` ×22).
 
-### Not run: the in-game e2e
+### Not run for 0.2.0: the in-game e2e
+
+*(0.2.1 has one — see [§ 0.2.1](#sdk-021-the-shared-sphere-2026-11-21) below.)*
 
 `tools/e2e.sh` now takes `GAME=<launcher-built horizon-client>` and an optional
 `CONTROL_GAME=<a launcher-built game without this package>`; `SELFTEST=1` still flips
@@ -158,3 +160,61 @@ the rate assertion so the leg can fail. A native `.hmod` is compiled into the ga
 installed in this environment**, so no 0.2.0 game exists to run it against. No in-game
 claim is made for the package; the 0.1.0 legs above are marked historical in
 `../_shared/evidence/dysoncubeproject/HISTORICAL.md`.
+
+## SDK 0.2.1: the shared sphere (2026-11-21)
+
+Pin: SDK nightly `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` (`package_format` 6), mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, for 26.3. The `.horizon/sdk` copy from
+0b14f8a was deleted first and the pin's SDK copied in from `../_shared/sdk/0a875da/`
+(trap 17a: a repin does not refresh it). Every step ran inside a
+`ports/tools/build-slot.sh` lease (`BUILD_LOCAL=1`, an explicit `cd ports/dysoncubeproject`),
+`CARGO_INCREMENTAL=0`, no `--target-dir`, no private `BUILD_SLOTS_DIR`.
+
+| step | command (in the port, inside a lease) | result | evidence |
+|---|---|---|---|
+| red first | `cargo test --offline` with `todo!()` bodies | **12 failed / 45 passed** | `evidence/dysoncubeproject/slice2-test-red.log` |
+| unit | `cargo test --offline` | **57 passed**, 0 failed | `sdk-test.log` |
+| lint | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, 0 warnings | `sdk-clippy.log` |
+| fmt | `cargo fmt --check` (not `--all`) | exit 0 | `sdk-fmt.log` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` | 68,932 B, `dbdc5aa7…` | `sdk-build.log` |
+| package again | same command | same sha256 | `sdk-build-second.log`, `sdk-sha256.txt` |
+| check | `cargo horizon-mod check dysoncubeproject.hmod` | exit 0, 60 entries | `sdk-check.log` |
+| fits (the pin) | `cargo horizon-mod fits … --build 0a875da` | `0a875da  made for`, exit 0 | `sdk-fits.log` |
+| fits (another build) | `cargo horizon-mod fits … --build 0b14f8a` | `0b14f8a  fits`, exit 0 | `sdk-fits-other.log` |
+| entries | `unzip -l` | 60 entries, no `Cargo.lock` | `sdk-entries.txt` |
+| gate | `verify-sdk-package.py dysoncubeproject` | **1/1** | quoted in `notes.md` |
+
+**Artifact:** `dysoncubeproject.hmod`, 68,932 B, sha256
+`dbdc5aa7bb629c6caabc16b6e476493bf5170c830f13711d25e620f38c9e6b94`, 60 entries, declared
+0.2.1.
+
+### The in-game legs (0.2.1)
+
+Built by `ports/tools/launcher-game.sh build dysoncubeproject --port ports/dysoncubeproject`
+(`Compiling dysoncubeproject (1 of 1)` in the build log — the manifest had changed, so the
+launcher did not reuse an older binary). The packaged `src/lib.rs`, `src/support.rs`,
+`src/runtime.rs` and `horizon-mod.toml` are `cmp`-identical to the port's — the game runs the
+delivered sources. The launch is `--offscreen` (the crafting phase opens a menu; a headless
+session has no renderer), and every mod command goes through `ctl chat "/…"`.
+
+| leg | file | verdict |
+|---|---|---|
+| the scenario, package present | `evidence/dysoncubeproject-e2e/e2e-launcher.log` | **PASS + EXIT:0** |
+| `SELFTEST=1` (rate flipped) | `e2e-launcher-selftest.log` | **FAIL + EXIT:1** at `the receiver filled at 1.0 FE/t` |
+| the same scenario, `GAME=$CONTROL_GAME` | `e2e-launcher-control.log` | **FAIL + EXIT:1** at `the beam recipe offered {"item":null,…}` |
+
+`python3 ports/tools/check-e2e-logs.py dysoncubeproject-e2e --strict` → **3/3**, every log
+ending in `EXIT:`.
+
+Runner facts that cost time here:
+
+- `build-slot.sh run` forwards `check`/`test`/`build` to the second machine unless
+  `BUILD_LOCAL=1`, and a forwarded step runs in the campaign copy — a *local* `cargo fmt`
+  only happens with `BUILD_LOCAL=1` **and** an explicit `cd ports/dysoncubeproject`.
+- The e2e guard wraps the leg and writes its own log under `evidence/e2e-guard/`; the
+  script's own output is the file to keep.
+- A shared reservoir makes the *pair* of receivers the unit of a rate assertion (one
+  receiver takes the tick's power), and a full buffer cannot show a night/day delta — both
+  cost one failed run before the phases were reordered.
+- `cargo horizon-mod fits --build 0b14f8a` false-failed on a local type named `Command`;
+  the runtime's command enum is `SphereOp` now (see `notes.md`).

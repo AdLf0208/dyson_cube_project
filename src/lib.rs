@@ -1,23 +1,26 @@
-//! Dyson Cube Project for Horizon — the ray receiver and its multiblock (slice 1).
+//! Dyson Cube Project for Horizon — the ray receiver, its multiblock and the shared
+//! per-player sphere (slices 1–2).
 //!
 //! Upstream's multiblock controller reserves a 3×6×3 box of air, writes sixteen
-//! `multiblock_structure` placeholders around itself and keeps a sphere of beams and
-//! solar sails in its block entity. Each server tick the sphere generates power, the
-//! receiver pulls what its buffer has room for when the sky allows, and it offers up to
-//! 50,000,000 FE a tick to the block below through a down-only energy capability.
+//! `multiblock_structure` placeholders around itself, and subscribes its placer to a
+//! sphere. The spheres are the level's own store (`DysonSphereProgressSavedData` as an
+//! attachment), so several receivers draw from the same reservoir: the level tick
+//! generates for every sphere once, and each server tick a receiver pulls what its
+//! buffer has room for when the sky allows and offers up to 50,000,000 FE a tick to
+//! the block below through a down-only energy capability.
 //!
 //! A moment that belongs to one block or block entity is a Part here: the controller's
-//! own placement refusal, its teardown, and its tick; the placeholder's teardown; and
-//! the controller item's placement notice. The two global hooks are the command tree
-//! and the command body.
+//! own placement refusal, its teardown, its tick, and the placement notice that
+//! subscribes it; the placeholder's teardown. The global hooks are the level tick (the
+//! sphere's generation) and the command tree and body.
 //!
-//! The rules themselves live in [`runtime`], byte-identical to the retired bundle's
-//! `runtime.rs` and tested by `cargo test` without the game.
+//! The rules themselves live in [`runtime`] and are tested by `cargo test` without the
+//! game.
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent,
-    BlockPart, BlockState, Command, Compound, Flow, Hooks, Host, ItemPart, LevelHost,
-    OnBlockPlacedByEvent, OnDestroyedByPlayerEvent, RegisterCommandsEvent, Registrar,
-    RegistrationContext, RunModCommandEvent, ServerHost, StateForPlacementEvent,
+    BlockPart, BlockState, Command, Compound, Flow, Hooks, Host, HostSide, ItemPart, LevelHost,
+    LevelTickPreEvent, OnBlockPlacedByEvent, OnDestroyedByPlayerEvent, RegisterCommandsEvent,
+    Registrar, RegistrationContext, RunModCommandEvent, ServerHost, StateForPlacementEvent,
 };
 
 pub mod runtime;
@@ -65,6 +68,18 @@ impl Hooks for Mod {
         for usage in support::USAGES {
             event.commands.push(Command::op(usage, 4));
         }
+    }
+
+    /// `DysonCubeProject`'s `LevelTickEvent.Pre`: every sphere of the Overworld refills
+    /// its reservoir once, before any receiver pulls from it.
+    fn level_tick_pre(&self, host: HostSide<'_>, event: &mut LevelTickPreEvent) {
+        let HostSide::Server(host) = host else {
+            return;
+        };
+        if event.level.dimension() != mod_api::DimensionKey::OVERWORLD {
+            return;
+        }
+        support::generate_spheres(host);
     }
 
     /// The command body: typed arguments in, the same readout text out.
@@ -183,7 +198,8 @@ impl BlockEntityPart for ReceiverEntity {
     }
 }
 
-/// The controller item: placing it forms the multiblock (`setPlacedBy`).
+/// The controller item: placing it subscribes its placer's sphere and forms the
+/// multiblock (`setPlacedBy`).
 struct ControllerItem;
 
 #[mod_api::horizon_part]
@@ -192,6 +208,10 @@ impl ItemPart for ControllerItem {
         let Some(level) = support::level_in_place(host) else {
             return;
         };
+        // `setPlacedBy` subscribes the placer before it writes the shell.
+        if let Some(placer) = event.placer {
+            let _ = support::subscribe_receiver(host, level, event.pos, placer.uuid());
+        }
         support::form_shell(host, level, event.pos);
     }
 }
@@ -209,5 +229,8 @@ mod tests {
             "dysoncubeproject:ray_receiver_controller"
         );
         assert_eq!(super::STRUCTURE, "dysoncubeproject:multiblock_structure");
+        // The sphere store's attachment key is the mod's own namespace, and the id it
+        // writes is the one `status` prints, so a rename would orphan a saved world.
+        assert!(manifest.contains("version = \"0.2.1\""));
     }
 }

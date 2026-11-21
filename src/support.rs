@@ -1,32 +1,36 @@
-// Game-side glue for the Dyson Cube Project ray receiver (slice 1).
+// Game-side glue for the Dyson Cube Project ray receiver and its shared sphere
+// (slices 1–2).
 //
-// The rules live in [`crate::runtime`] and are byte-identical to the retired
-// .hnmod's `runtime.rs`; this module only reads the world, calls the runtime and
-// writes the result back.
+// The rules live in [`crate::runtime`]; this module only reads the world, calls the
+// runtime and writes the result back.
 //
 // Shape, as upstream has it: placing the controller reserves a 3×6×3 box of air
 // (`MultiblockStructure.validateSpace`), the placement writes sixteen
 // `multiblock_structure` placeholders around it, and a broken placeholder takes
-// the controller with it. The controller's block entity keeps the sphere
-// (`beams`, `solarPanels`, `storedPower`, `lastConsumedPower`) and the FE buffer
-// as the int `energy` the declared energy capability reads. Each server tick the
-// sphere generates, the receiver pulls what its buffer has room for when the sky
-// allows (`Level.isDay && !isRaining && canSeeSky`), and it hands up to
-// 50,000,000 FE to the block below.
+// the controller with it. The spheres are the **level's** shared store, one
+// `SPHERES` attachment saved with the dimension (`DysonSphereProgressSavedData`):
+// `spheres` by id and `subscribedPlayers` by UUID, a player's own UUID when they
+// subscribed to none. A controller subscribes on placement and saves its sphere id;
+// the level tick generates power for every sphere once, and each server tick a
+// receiver pulls what its buffer has room for when the sky allows
+// (`Level.isDay && !isRaining && canSeeSky`) and hands up to 50,000,000 FE to the
+// block below.
 //
 // Read from Dyson Cube Project 1.0.5 (`MultiblockStructure.validateSpace`,
 // `RayReceiverControllerBlock.setPlacedBy/onRemove`, `MultiblockStructureBlock`,
-// `RayReceiverBlockEntity.serverTick`, `DysonSphereStructure`, `Config`,
-// `DysonCubeProject`'s level tick and commands). See `../FINDINGS.md`.
+// `RayReceiverBlockEntity.serverTick`, `DysonSphereStructure`,
+// `DysonSphereProgressSavedData`, `Config`, `DysonCubeProject`'s level tick and
+// commands). See `../FINDINGS.md`.
 use mod_api::{
-    BlockShapeKind, BlockUpdateFlags, CommandArgument, CommandArgumentValue, Compound,
-    DimensionKey, Direction, ENERGY, HostTransaction, LevelHost, LevelRef, ModEnergyBuffer,
-    ServerHost, Tag, Text,
+    AttachmentCodec, AttachmentError, AttachmentType, BlockShapeKind, BlockUpdateFlags,
+    CommandArgument, CommandArgumentValue, Compound, DimensionKey, Direction, ENERGY, Holder,
+    HostTransaction, LevelHost, LevelRef, ModEnergyBuffer, ServerHost, Tag, Text,
 };
 
 use crate::runtime::{
-    Buffer, Command as SphereCommand, RAY_RECEIVER_EXTRACT_POWER, RAY_RECEIVER_POWER_BUFFER, Sky,
-    Sphere, Stat, USAGE, is_air, open_to_sky, structure_positions, tick, validate_space, volume,
+    Buffer, RAY_RECEIVER_EXTRACT_POWER, RAY_RECEIVER_POWER_BUFFER, Sky, Sphere, SphereOp, Spheres,
+    Stat, USAGE, harvest, is_air, open_to_sky, structure_positions, uuid_text, validate_space,
+    volume,
 };
 
 pub(crate) const CONTROLLER: &str = "dysoncubeproject:ray_receiver_controller";
@@ -37,14 +41,31 @@ const AIR: &str = "minecraft:air";
 const OVERWORLD: DimensionKey = DimensionKey::OVERWORLD;
 /// The sixteen placeholders upstream writes.
 const PLACEHOLDERS: usize = 16;
+/// The receiver's saved sphere id (`RayReceiverBlockEntity`'s `@Save dysonSphereId`).
+const SPHERE_ID: &str = "dysonSphereId";
+
+/// The level's spheres: `DysonSphereProgressSavedData` as one level attachment
+/// (`Holder::Level`), which the game saves into the dimension's
+/// `data/horizon/attachments.dat`. The codec is upstream's `save`/`load` shape.
+static SPHERES: AttachmentType<Spheres> = AttachmentType {
+    namespace: "dysoncubeproject",
+    name: "spheres",
+    default: Spheres::new,
+    codec: Some(AttachmentCodec {
+        encode: encode_spheres,
+        decode: decode_spheres,
+    }),
+    copy_on_death: false,
+    sync: false,
+};
 
 /// Upstream's five usages, all at permission level 4.
 pub(crate) const USAGES: [&str; 5] = [
     "dysoncubeproject status <pos:block_pos>",
-    "dysoncubeproject set beams <pos:block_pos> <value:integer>",
-    "dysoncubeproject set panels <pos:block_pos> <value:integer>",
-    "dysoncubeproject add beams <pos:block_pos> <delta:integer>",
-    "dysoncubeproject add panels <pos:block_pos> <delta:integer>",
+    "dysoncubeproject set beams <sphere:word> <value:integer>",
+    "dysoncubeproject set panels <sphere:word> <value:integer>",
+    "dysoncubeproject add beams <sphere:word> <delta:integer>",
+    "dysoncubeproject add panels <sphere:word> <delta:integer>",
 ];
 
 /// `Level.setBlock`'s `UPDATE_ALL`: neighbours and clients are told.
@@ -63,8 +84,19 @@ fn write_int(nbt: &mut Compound, key: &str, value: i32) {
     nbt.insert(key.into(), Tag::Int(value));
 }
 
-/// The sphere as `DysonSphereStructure.serializeNBT` saves it.
-pub(crate) fn sphere_of(nbt: &Compound) -> Sphere {
+fn read_string(nbt: &Compound, key: &str) -> String {
+    match nbt.get(&key.into()) {
+        Some(Tag::String(value)) => value.to_string_lossy(),
+        _ => String::new(),
+    }
+}
+
+fn write_string(nbt: &mut Compound, key: &str, value: &str) {
+    nbt.insert(key.into(), Tag::String(value.into()));
+}
+
+/// One sphere as `DysonSphereStructure.serializeNBT` saves it.
+fn sphere_of(nbt: &Compound) -> Sphere {
     let mut sphere = Sphere::new();
     sphere.beams = read_int(nbt, "beams").max(0);
     sphere.solar_panels = read_int(nbt, "solarPanels").max(0);
@@ -73,11 +105,99 @@ pub(crate) fn sphere_of(nbt: &Compound) -> Sphere {
     sphere
 }
 
-pub(crate) fn store_sphere(nbt: &mut Compound, sphere: &Sphere) {
-    write_int(nbt, "beams", sphere.beams);
-    write_int(nbt, "solarPanels", sphere.solar_panels);
-    write_int(nbt, "storedPower", sphere.stored_power);
-    write_int(nbt, "lastConsumedPower", sphere.last_consumed_power);
+/// `DysonSphereProgressSavedData.save`: `spheres` and `subscribedPlayers`.
+fn encode_spheres(spheres: &Spheres) -> Result<Compound, AttachmentError> {
+    let mut list = Compound::new();
+    for (id, sphere) in &spheres.spheres {
+        let mut one = Compound::new();
+        write_int(&mut one, "beams", sphere.beams);
+        write_int(&mut one, "solarPanels", sphere.solar_panels);
+        write_int(&mut one, "storedPower", sphere.stored_power);
+        write_int(&mut one, "lastConsumedPower", sphere.last_consumed_power);
+        list.insert(id.as_str().into(), Tag::Compound(one));
+    }
+    let mut subscribers = Compound::new();
+    for (player, id) in &spheres.subscribed {
+        subscribers.insert(player.as_str().into(), Tag::String(id.as_str().into()));
+    }
+    let mut saved = Compound::new();
+    saved.insert("spheres".into(), Tag::Compound(list));
+    saved.insert("subscribedPlayers".into(), Tag::Compound(subscribers));
+    Ok(saved)
+}
+
+/// `DysonSphereProgressSavedData.load`: what `encode_spheres` wrote. A value of the
+/// wrong shape is skipped, as a saved data that starts over does.
+fn decode_spheres(saved: &Compound) -> Result<Spheres, AttachmentError> {
+    let mut spheres = Spheres::new();
+    if let Some(Tag::Compound(list)) = saved.get(&"spheres".into()) {
+        for (id, value) in list {
+            let Tag::Compound(one) = value else {
+                continue;
+            };
+            spheres.spheres.insert(id.to_string_lossy(), sphere_of(one));
+        }
+    }
+    if let Some(Tag::Compound(subscribers)) = saved.get(&"subscribedPlayers".into()) {
+        for (player, value) in subscribers {
+            let Tag::String(id) = value else {
+                continue;
+            };
+            spheres
+                .subscribed
+                .insert(player.to_string_lossy(), id.to_string_lossy());
+        }
+    }
+    Ok(spheres)
+}
+
+/// The level's spheres (`Holder::Level` is the level in place), empty when none were
+/// ever stored: a read never writes the store.
+pub(crate) fn spheres_of(host: &mut dyn ServerHost) -> Spheres {
+    SPHERES
+        .get_existing(host.attachments(), Holder::Level)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Replaces the level's spheres after a change.
+pub(crate) fn store_spheres(host: &mut dyn ServerHost, spheres: Spheres) {
+    let _ = SPHERES.set(host.attachments(), Holder::Level, spheres);
+}
+
+/// `DysonCubeProject`'s level tick: every sphere of the level refills its reservoir
+/// once, so two receivers on one sphere share that tick's power instead of each
+/// generating it.
+pub(crate) fn generate_spheres(host: &mut dyn ServerHost) {
+    let mut spheres = spheres_of(host);
+    if spheres.spheres.is_empty() {
+        return;
+    }
+    spheres.generate();
+    store_spheres(host, spheres);
+}
+
+/// `RayReceiverControllerBlock.setPlacedBy`'s subscription: the placer's sphere
+/// (`getSubscribedFor`), created when absent, is saved in the controller as its
+/// `dysonSphereId`.
+pub(crate) fn subscribe_receiver(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    placer: u128,
+) -> Option<String> {
+    let player = uuid_text(placer);
+    let mut spheres = spheres_of(host);
+    let id = spheres.sphere_for(&player);
+    spheres.subscribe(&player, &id);
+    store_spheres(host, spheres);
+    let mut patch = Compound::new();
+    write_string(&mut patch, SPHERE_ID, &id);
+    if let Some(entity) = host.block_entity(level, pos) {
+        let _ = entity.merge_data(host, patch);
+    }
+    Some(id)
 }
 
 /// The controller a placeholder belongs to (`MultiblockStructureBlockEntity`'s
@@ -267,10 +387,10 @@ pub(crate) fn sky_at(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> S
     }
 }
 
-/// One server tick of the controller (`RayReceiverBlockEntity.serverTick`):
-/// generate, pull, then give what the buffer offers to the block below, whose
-/// energy capability is asked through its up face as vanilla's
-/// `getCapability(…, pos.below(), Direction.UP)` does.
+/// One server tick of the controller (`RayReceiverBlockEntity.serverTick`): pull from
+/// the level's shared sphere the controller subscribed to, then give what the buffer
+/// offers to the block below, whose energy capability is asked through its up face as
+/// vanilla's `getCapability(…, pos.below(), Direction.UP)` does.
 pub(crate) fn receiver_tick(
     host: &mut dyn ServerHost,
     level: LevelRef,
@@ -278,9 +398,15 @@ pub(crate) fn receiver_tick(
     nbt: &mut Compound,
 ) {
     let sky = sky_at(host, level, pos);
-    let mut sphere = sphere_of(nbt);
     let mut buffer = Buffer::new(read_int(nbt, "energy"));
-    let _ = tick(&mut buffer, &mut sphere, sky);
+    let id = read_string(nbt, SPHERE_ID);
+    if !id.is_empty() {
+        let mut spheres = spheres_of(host);
+        let took = harvest(&mut buffer, spheres.sphere_mut(&id), sky);
+        if took > 0 {
+            store_spheres(host, spheres);
+        }
+    }
     let offer = buffer.offer_down();
     let mut down = 0;
     if offer > 0 {
@@ -300,24 +426,32 @@ pub(crate) fn receiver_tick(
             down = buffer.take_down(i32::try_from(accepted).unwrap_or(i32::MAX));
         }
     }
-    store_sphere(nbt, &sphere);
     write_int(nbt, "energy", buffer.energy);
     write_int(nbt, "down", down);
 }
 
 /// The controller's readout: the six lines of upstream's `DysonProgressGuiAddon`
 /// (`Dyson Information`, `Progress`, `Power Gen`, `Power Con`, `Beams`, `Sails`)
-/// plus the buffer the GUI's energy bar draws.
-pub(crate) fn status_text(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String {
-    let entity = host.block_entity(level, pos);
-    let data = entity.as_ref().and_then(|entity| entity.data(host));
+/// plus the sphere it reads and the buffer the GUI's energy bar draws.
+pub(crate) fn status_text(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String {
     if !is_block(host, level, pos, CONTROLLER) {
         return format!("No ray receiver at {}, {}, {}.", pos[0], pos[1], pos[2]);
     }
-    let Some(data) = data else {
+    let shared: &dyn ServerHost = host;
+    let Some(data) = host
+        .block_entity(level, pos)
+        .and_then(|entity| entity.data(shared))
+    else {
         return format!("No ray receiver at {}, {}, {}.", pos[0], pos[1], pos[2]);
     };
-    let sphere = sphere_of(&data);
+    let id = read_string(&data, SPHERE_ID);
+    let sphere = if id.is_empty() {
+        None
+    } else {
+        spheres_of(host).sphere(&id).copied()
+    };
+    let sphere = sphere.unwrap_or_default();
+    let named = if id.is_empty() { "none" } else { &id };
     let placeholders = placeholder_count(host, level, pos);
     let box_size = volume(pos).size();
     let formed = if placeholders == PLACEHOLDERS {
@@ -326,7 +460,7 @@ pub(crate) fn status_text(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3])
         "not formed"
     };
     format!(
-        "Ray Receiver at {},{},{}: {formed}, box {}x{}x{}, structure {placeholders}/{PLACEHOLDERS}, beams {}, sails {}/{}, progress {}%, gen {} FE/t, con {} FE/t, stored {}, buffer {}/{} FE, down {}, t={}",
+        "Ray Receiver at {},{},{}: {formed}, box {}x{}x{}, structure {placeholders}/{PLACEHOLDERS}, sphere '{named}', beams {}, sails {}/{}, progress {}%, gen {} FE/t, con {} FE/t, stored {}, buffer {}/{} FE, down {}, t={}",
         pos[0],
         pos[1],
         pos[2],
@@ -347,61 +481,41 @@ pub(crate) fn status_text(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3])
     )
 }
 
-/// Upstream's `set`/`add` on the sphere this controller holds. The command
-/// addresses the controller: the SDK has no level saved data to key a sphere by
-/// its player (`../notes.md`, deviations).
+/// Upstream's `set`/`add` on one sphere of the level, by its id, with upstream's
+/// messages.
 pub(crate) fn change_sphere(
     host: &mut dyn ServerHost,
-    level: LevelRef,
-    pos: [i32; 3],
+    id: &str,
     stat: Stat,
     value: i32,
     add: bool,
 ) -> String {
-    let changed = change_sphere_at(host, level, pos, stat, value, add);
+    let mut spheres = spheres_of(host);
+    let now = match (stat, add) {
+        (Stat::Beams, false) => spheres.set_beams(id, value),
+        (Stat::Beams, true) => spheres.add_beams(id, value),
+        (Stat::Panels, false) => spheres.set_panels(id, value),
+        (Stat::Panels, true) => spheres.add_panels(id, value),
+    };
+    store_spheres(host, spheres);
     let name = match stat {
         Stat::Beams => "beams",
         Stat::Panels => "solar panels",
     };
-    match changed {
-        Some(now) if add => format!("{name} at {}, {}, {} is now {now}", pos[0], pos[1], pos[2]),
-        Some(now) => format!("Set {name} at {}, {}, {} to {now}", pos[0], pos[1], pos[2]),
-        None => format!("No ray receiver at {}, {}, {}.", pos[0], pos[1], pos[2]),
-    }
-}
-
-fn change_sphere_at(
-    host: &mut dyn ServerHost,
-    level: LevelRef,
-    pos: [i32; 3],
-    stat: Stat,
-    value: i32,
-    add: bool,
-) -> Option<i32> {
-    let entity = host.block_entity(level, pos)?;
-    let data = entity.data(host)?;
-    let mut sphere = sphere_of(&data);
-    let now = match (stat, add) {
-        (Stat::Beams, false) => sphere.set_beams(value),
-        (Stat::Beams, true) => sphere.add_beams(value),
-        (Stat::Panels, false) => sphere.set_solar_panels(value),
-        (Stat::Panels, true) => sphere.add_solar_panels(value),
-    };
-    let mut patch = Compound::new();
-    store_sphere(&mut patch, &sphere);
-    match entity.merge_data(host, patch) {
-        Ok(_) => Some(now),
-        Err(_) => None,
+    if add {
+        format!("{name} for sphere '{id}' is now {now}")
+    } else {
+        format!("Set {name} for sphere '{id}' to {now}")
     }
 }
 
 /// One `/dysoncubeproject` line, after the dispatcher resolved its typed
 /// arguments (0.1.0 split the raw words itself; the SDK hands over the parsed
 /// form, so no string is re-parsed).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Invocation {
-    /// One of upstream's three forms.
-    Command(SphereCommand),
+    /// One of upstream's forms.
+    Sphere(SphereOp),
     /// Ours, but not one of its forms.
     Usage,
     /// Another command: the mod leaves it alone.
@@ -417,31 +531,35 @@ pub(crate) fn invocation(literals: &[String], arguments: &[CommandArgument]) -> 
         Some(CommandArgumentValue::BlockPos(pos)) => Some(*pos),
         _ => None,
     };
+    let sphere = || match argument(arguments, "sphere") {
+        Some(CommandArgumentValue::String(id)) if !id.is_empty() => Some(id.clone()),
+        _ => None,
+    };
     match *rest {
         ["status"] => match position() {
-            Some(pos) => Invocation::Command(SphereCommand::Status { pos }),
+            Some(pos) => Invocation::Sphere(SphereOp::Status { pos }),
             None => Invocation::Usage,
         },
         [change @ ("set" | "add"), stat] => {
             let Some(stat) = stat_of(stat) else {
                 return Invocation::Usage;
             };
-            let (Some(pos), Some(CommandArgumentValue::Integer(value))) = (
-                position(),
+            let (Some(sphere), Some(CommandArgumentValue::Integer(value))) = (
+                sphere(),
                 argument(arguments, "value").or_else(|| argument(arguments, "delta")),
             ) else {
                 return Invocation::Usage;
             };
-            Invocation::Command(if change == "set" {
-                SphereCommand::Set {
+            Invocation::Sphere(if change == "set" {
+                SphereOp::Set {
                     stat,
-                    pos,
+                    sphere,
                     value: *value,
                 }
             } else {
-                SphereCommand::Add {
+                SphereOp::Add {
                     stat,
-                    pos,
+                    sphere,
                     value: *value,
                 }
             })
@@ -477,13 +595,17 @@ pub(crate) fn run_command(
     let message = match invocation(literals, arguments) {
         Invocation::NotOurs => return false,
         Invocation::Usage => USAGE.to_owned(),
-        Invocation::Command(SphereCommand::Status { pos }) => status_text(host, level, pos),
-        Invocation::Command(SphereCommand::Set { stat, pos, value }) => {
-            change_sphere(host, level, pos, stat, value, false)
-        }
-        Invocation::Command(SphereCommand::Add { stat, pos, value }) => {
-            change_sphere(host, level, pos, stat, value, true)
-        }
+        Invocation::Sphere(SphereOp::Status { pos }) => status_text(host, level, pos),
+        Invocation::Sphere(SphereOp::Set {
+            stat,
+            sphere,
+            value,
+        }) => change_sphere(host, &sphere, stat, value, false),
+        Invocation::Sphere(SphereOp::Add {
+            stat,
+            sphere,
+            value,
+        }) => change_sphere(host, &sphere, stat, value, true),
     };
     // Routed to the command's source, as vanilla's own feedback is.
     let _ = host.commands().feedback(Text::literal(message));
@@ -495,30 +617,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_stored_sphere_reads_back() {
-        let mut nbt = Compound::new();
-        let mut sphere = Sphere::new();
-        sphere.beams = 17;
-        sphere.solar_panels = 100;
-        sphere.stored_power = 2_000;
-        sphere.last_consumed_power = 1_500;
-        store_sphere(&mut nbt, &sphere);
-        assert_eq!(sphere_of(&nbt), sphere);
-        assert_eq!(read_int(&nbt, "solarPanels"), 100);
+    fn the_store_codec_round_trips_upstreams_saved_form() {
+        let mut spheres = Spheres::new();
+        spheres.set_beams("a", 17);
+        spheres.set_panels("a", 100);
+        spheres.add_beams("b", 2);
+        spheres.subscribe("10000000-0000-0000-0000-0000000000aa", "a");
+
+        let saved = encode_spheres(&spheres).expect("the store encodes");
+        let Some(Tag::Compound(list)) = saved.get(&"spheres".into()) else {
+            panic!("upstream saves a `spheres` compound");
+        };
+        assert!(
+            matches!(list.get(&"a".into()), Some(Tag::Compound(_))),
+            "each sphere is a compound under its id"
+        );
+        let Some(Tag::Compound(subs)) = saved.get(&"subscribedPlayers".into()) else {
+            panic!("upstream saves a `subscribedPlayers` compound");
+        };
+        assert!(matches!(
+            subs.get(&"10000000-0000-0000-0000-0000000000aa".into()),
+            Some(Tag::String(id)) if id.to_string_lossy() == "a"
+        ));
+        assert_eq!(decode_spheres(&saved).expect("it decodes"), spheres);
     }
 
     #[test]
-    fn an_empty_compound_is_an_empty_sphere() {
-        assert_eq!(sphere_of(&Compound::new()), Sphere::new());
+    fn an_empty_saved_store_reads_as_no_spheres() {
+        assert_eq!(
+            decode_spheres(&Compound::new()).expect("an empty store decodes"),
+            Spheres::new()
+        );
+        assert_eq!(
+            encode_spheres(&Spheres::new()).expect("an empty store encodes"),
+            {
+                let mut saved = Compound::new();
+                saved.insert("spheres".into(), Tag::Compound(Compound::new()));
+                saved.insert("subscribedPlayers".into(), Tag::Compound(Compound::new()));
+                saved
+            }
+        );
     }
 
     #[test]
     fn a_negative_saved_sphere_reads_as_zero() {
-        let mut nbt = Compound::new();
-        write_int(&mut nbt, "beams", -4);
-        write_int(&mut nbt, "solarPanels", -9);
-        assert_eq!(sphere_of(&nbt).beams, 0);
-        assert_eq!(sphere_of(&nbt).solar_panels, 0);
+        let mut one = Compound::new();
+        write_int(&mut one, "beams", -4);
+        write_int(&mut one, "solarPanels", -9);
+        let mut list = Compound::new();
+        list.insert("x".into(), Tag::Compound(one));
+        let mut saved = Compound::new();
+        saved.insert("spheres".into(), Tag::Compound(list));
+        let spheres = decode_spheres(&saved).expect("it decodes");
+        assert_eq!(spheres.sphere("x").expect("x exists").beams, 0);
+        assert_eq!(spheres.sphere("x").expect("x exists").solar_panels, 0);
     }
 
     #[test]
@@ -530,6 +682,14 @@ mod tests {
             [100, 140, -7],
             "the placeholder's saved controller position"
         );
+    }
+
+    #[test]
+    fn the_receivers_saved_sphere_id_round_trips() {
+        let mut nbt = Compound::new();
+        write_string(&mut nbt, SPHERE_ID, "a-uuid");
+        assert_eq!(read_string(&nbt, SPHERE_ID), "a-uuid");
+        assert_eq!(read_string(&Compound::new(), SPHERE_ID), "");
     }
 
     #[test]
@@ -565,13 +725,14 @@ mod tests {
     }
 
     #[test]
-    fn the_three_forms_map_onto_the_runtime() {
+    fn the_forms_map_onto_the_runtime() {
+        let sphere = "01234567-89ab-cdef-0123-456789abcdef".to_owned();
         assert_eq!(
             line(
                 &["dysoncubeproject", "status"],
                 &[("pos", CommandArgumentValue::BlockPos([100, 140, -7]))]
             ),
-            Invocation::Command(SphereCommand::Status {
+            Invocation::Sphere(SphereOp::Status {
                 pos: [100, 140, -7]
             })
         );
@@ -579,13 +740,13 @@ mod tests {
             line(
                 &["dysoncubeproject", "set", "beams"],
                 &[
-                    ("pos", CommandArgumentValue::BlockPos([1, 2, 3])),
+                    ("sphere", CommandArgumentValue::String(sphere.clone())),
                     ("value", CommandArgumentValue::Integer(17)),
                 ]
             ),
-            Invocation::Command(SphereCommand::Set {
+            Invocation::Sphere(SphereOp::Set {
                 stat: Stat::Beams,
-                pos: [1, 2, 3],
+                sphere,
                 value: 17,
             })
         );
@@ -593,13 +754,13 @@ mod tests {
             line(
                 &["dysoncubeproject", "add", "panels"],
                 &[
-                    ("pos", CommandArgumentValue::BlockPos([1, 2, 3])),
+                    ("sphere", CommandArgumentValue::String("other".to_owned())),
                     ("delta", CommandArgumentValue::Integer(-6)),
                 ]
             ),
-            Invocation::Command(SphereCommand::Add {
+            Invocation::Sphere(SphereOp::Add {
                 stat: Stat::Panels,
-                pos: [1, 2, 3],
+                sphere: "other".to_owned(),
                 value: -6,
             })
         );
@@ -626,7 +787,7 @@ mod tests {
         assert_eq!(
             line(
                 &["dysoncubeproject", "set", "beams"],
-                &[("pos", CommandArgumentValue::BlockPos([1, 2, 3]))]
+                &[("sphere", CommandArgumentValue::String(String::new()))]
             ),
             Invocation::Usage
         );
@@ -635,5 +796,6 @@ mod tests {
     #[test]
     fn the_usage_line_is_upstreams() {
         assert!(USAGE.starts_with("Usage: /dysoncubeproject status"));
+        assert!(USAGE.contains("set|add beams|panels <sphere> <value>"));
     }
 }

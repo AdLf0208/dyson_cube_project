@@ -10,10 +10,11 @@ what is specific to this directory.
   packed). `src/lib.rs` is the one `impl mod_api::Hooks` plus this port's Parts;
   `src/support.rs` is the game glue; `src/runtime.rs` is the pure model and its tests.
   `assets/` and `data/` are the carried content, at the package root.
-- **`src/runtime.rs` is byte-identical to the retired 0.1.0 bundle's copy.** Do not format,
-  edit or "improve" it; the campaign's rule is that a migration changes glue, manifest and
-  packaging only. `cmp` it against
+- **`src/runtime.rs` is the pure model**, extended by slice 2 (the shared sphere store
+  and `harvest`); it no longer matches the retired 0.1.0 copy byte for byte, and the
+  retired copy is kept only as history at
   `../_shared/evidence/dysoncubeproject/retired-hnmod-0.1.0/mixins/dysoncubeproject/runtime.rs`.
+  Keep new rules in `runtime.rs` (no `mod_api` types) and the game access in `support.rs`.
 - **Nothing else may sit at the package root.** `cargo horizon-mod build` refuses any path
   that is not a package path, which is why `mixins/`, `content/`, `compatibility.json`,
   `rust-toolchain.toml`, `tools/horizon.py`, `tools/package.py`, `tools/package.sh` and

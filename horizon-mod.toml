@@ -1,18 +1,19 @@
 # Dyson Cube Project for Horizon — one flat SDK package (mod API 0.2).
 #
 # Slice 1: the ray receiver controller and the multiblock placeholder it writes, the
-# sphere's power model, and upstream's four operator command forms. The blocks, items,
-# models, textures, lang, recipes, loot and tags are carried from Dyson Cube Project
-# 1.0.5 (MIT, InnovativeOnlineIndustries/Dyson-Cube-Project); the behaviour is a
-# clean-room Rust rewrite, and `src/runtime.rs` is byte-identical to the retired
-# .hnmod's pure model. Local-only until the maintainer approves publishing
-# (ARCHITECTURE.md §8).
+# sphere's power model, and upstream's four operator command forms. Slice 2: the shared
+# per-player sphere — one level store (a level attachment, saved with the world) that
+# every receiver on the same player's sphere draws from, generated once per level tick
+# as upstream's `LevelTickEvent.Pre` does. The blocks, items, models, textures, lang,
+# recipes, loot and tags are carried from Dyson Cube Project 1.0.5 (MIT,
+# InnovativeOnlineIndustries/Dyson-Cube-Project); the behaviour is a clean-room Rust
+# rewrite. Local-only until the maintainer approves publishing (ARCHITECTURE.md §8).
 id = "dysoncubeproject"
 name = "Dyson Cube Project"
 # The port's own version, not the original mod's 1.0.5: a resubmission is always a new
-# version (the retired .hnmod bundle was 0.1.0).
-version = "0.2.0"
-description = """A Dyson-sphere ray receiver: place the controller where its 3x6x3 shell fits and it writes the sixteen multiblock placeholders around itself, then pulls up to 50,000,000 FE a tick from a sphere of solar sails into a 100,000,000 FE buffer that only gives power through its bottom face. Beams support six sails each, a sail makes 20 FE a tick, and /dysoncubeproject status, set and add read and change the sphere at a controller. This slice has the receiver, its multiblock and the beam and solar-sail components; the EM Rail Ejector (the only way to grow a sphere in game), the shared per-player sphere, the client renderers and GUIs, and the advancements are not ported yet."""
+# version (the retired .hnmod bundle was 0.1.0, the flat package's first publication 0.2.0).
+version = "0.2.1"
+description = """A Dyson-sphere ray receiver: place the controller where its 3x6x3 shell fits and it writes the sixteen multiblock placeholders around itself, then pulls up to 50,000,000 FE a tick from the sphere of solar sails its owner subscribed to into a 100,000,000 FE buffer that only gives power through its bottom face. The sphere is the level's shared per-player sphere (one store, saved with the world, generated once per tick), so several receivers draw from it together: beams support six sails each and a sail makes 20 FE a tick. /dysoncubeproject status reads a controller and set|add beams|panels change a sphere by its id. This package has the receiver, its multiblock and the beam and solar-sail components; the EM Rail Ejector (the only way to grow a sphere in game), the client renderers and GUIs, and the advancements are not ported yet."""
 authors = ["Buuz135 (upstream)", "Horizon native mod contributors"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
 # beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's
@@ -28,5 +29,5 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+horizon = "0a875da91dbb0fdcb7ba8c42c11341aa229af51a"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

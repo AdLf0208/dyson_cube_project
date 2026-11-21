@@ -86,6 +86,8 @@ the six tags in `data/c/tags/item/…`, mapping each to the vanilla item NeoForg
 contains, so the five recipes can match. **Limitation:** a craft cannot be driven in
 this campaign's headless e2e (the slot-click path needs a renderer), so the fix is
 proven by the declared data and `cargo horizon-mod check`, not by a craft in game.
+*(Corrected in slice 2: a craft **can** be driven — `--offscreen` gives the session
+a renderer, and all five recipes are crafted in the 0.2.1 e2e. See "Slice 2" below.)*
 
 Two content decisions, both recorded:
 - the jar's **block models are empty** (`{"textures":{"particle":…}}`, no elements):
@@ -460,5 +462,198 @@ by this format:
 | Fits | `cargo horizon-mod fits --build nightly` | EXIT 0 (`sdk-fits.log`) |
 | `runtime.rs` untouched | `cmp` + pack hash | `89598f0c…4b1a` three ways (`sdk-runtime-sha256.txt`) |
 | Content unchanged | sha256 diff | 51 files identical (`sdk-content-carry.log`) |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-port
+
+## Slice 2 — the shared per-player sphere (0.2.1, 2026-11-21)
+
+Pins: SDK nightly **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`**, mixins
+**`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`**, `package_format` 6, for **26.3**. The
+SDK is cached in-tree at `../_shared/sdk/0a875da/` and copied into `.horizon/sdk/`
+(git-ignored, never packed); the stale 0b14f8a copy was deleted first (trap 17a).
+
+**The gap line it comes from** (`notes.md` § Gaps, item 2): *"**The shared sphere**:
+`DysonSphereProgressSavedData`, subscribe/unsubscribe, one sphere for several receivers,
+the `DysonSphereSyncMessage` packet."*
+
+**Why this before the EM Rail Ejector** (the first gap line): the ejector's own line calls
+its ejection *"the only way to grow a sphere"*, and slice 1's sphere belonged to **one
+controller** — a deviation forced by the 0.1.0 pin's missing level saved data. An ejector
+on that model could only grow its own private copy, and a "nearest receiver" link would be
+an invented rule. At `0a875da` the SDK has **level attachments** (`AttachmentType` +
+`Holder::Level`, saved per dimension by `SaveDir::load_attachments`/`save_attachments` into
+`data/horizon/attachments.dat`), which is upstream's `DysonSphereProgressSavedData`. So the
+prerequisite became port-able and goes first; the ejector is now a clean next slice. The
+sync packet stays part of the client gap (there is no client half yet).
+
+### What changed
+
+| aspect | slice 1 (0.2.0) | slice 2 (0.2.1), as upstream has it |
+|---|---|---|
+| the sphere | in the controller's block entity, one per controller | the level's `SPHERES` attachment: `spheres` by id and `subscribedPlayers` by UUID (`DysonSphereProgressSavedData.save/load`), saved with the dimension |
+| who owns a sphere | the controller | the placer: `getSubscribedFor(uuid)` is the subscribed sphere, their own UUID otherwise; a placement creates it (`computeIfAbsent`) and saves the id in the controller (`dysonSphereId`) |
+| generation | inside the receiver's tick | `Hooks::level_tick_pre`, Overworld only — once per sphere per level tick, as upstream's `LevelTickEvent.Pre`; a receiver only pulls (`runtime::harvest`) |
+| receivers per sphere | one | any number: they share the tick's reservoir, and each is gated by its own sky |
+| commands | `set|add … <x> <y> <z> <n>` | upstream's own `set|add beams|panels <sphere> <n>`, with upstream's messages; `status <x> <y> <z>` stays ours (the GUI addon as a line) and names the sphere |
+
+### Hooks
+
+| Hook | Helper | What it does |
+|---|---|---|
+| `level_tick_pre` | `support::generate_spheres` | Every sphere of the Overworld refills its reservoir once. |
+| `on_block_placed_by` | `support::subscribe_receiver` + `form_shell` | Subscribes the placer's sphere, saves `dysonSphereId`, writes the shell (as before). |
+| `block_entity_tick` | `support::receiver_tick` | Pulls from the sphere named by `dysonSphereId` (no generation), then pushes down. |
+| `status` / `set|add` | `support::{status_text,change_sphere}` | Readout and the four upstream forms, by sphere id. |
+
+`level_tick_pre` is a new global hook (stamped at the pin); the other five hook methods are
+the existing ones. **A local type must not be named after an SDK type:** the runtime's
+command enum was `Command`, and `cargo horizon-mod fits --build 0b14f8a` read the API's
+`Command` instead and reported *"the type `Command` can no longer be built with a literal,
+and `src/support.rs:540` builds it"* (exit 1). Renaming it to `SphereOp`/`LineError` (and
+the `Invocation::Command` variant to `Sphere`) makes the same check answer `0b14f8a fits`.
+This is trap 3 of the 2026-11-21 hand-over, met in person.
+
+### Red → green (TDD)
+
+The family's rules were written as failing tests first, with `todo!()` bodies for the two
+new runtime functions and the store codec:
+
+```
+test result: FAILED. 45 passed; 12 failed; 0 ignored; 0 measured; 0 filtered out
+thread 'runtime::tests::a_uuid_reads_as_java_prints_it' panicked at src/runtime.rs:309:5:
+not yet implemented: slice 2: the UUID a sphere id is named by
+thread 'runtime::tests::two_receivers_draw_from_one_reservoir' panicked at src/runtime.rs:412:5:
+not yet implemented: slice 2: a receiver pulls from the shared sphere without generating
+thread 'support::tests::the_store_codec_round_trips_upstreams_saved_form' panicked at src/support.rs:110:5:
+not yet implemented: slice 2: the sphere store's saved form
+```
+
+(`../_shared/evidence/dysoncubeproject/slice2-test-red.log`, the whole run.) Then the
+implementation, and **57 tests pass** — 46 runtime rules (the store, the UUID text, the clamped set/add by id,
+generate-once, the shared reservoir, `harvest` without generation, the command grammar) and
+10 glue tests (the saved form round trip, the saved sphere id, the typed command mapping)
+plus the package-id test.
+
+### In game (three legs, `../_shared/evidence/dysoncubeproject-e2e/`)
+
+A launcher build (`launcher-game.sh build dysoncubeproject`; the log says
+`Compiling dysoncubeproject (1 of 1)`, and the packaged `src/*.rs` + manifest are
+`cmp`-identical to the port's), launched `--offscreen` because the crafting phase opens a
+menu.
+
+`e2e-launcher.log` — **PASS + EXIT:0**:
+
+| phase | measured |
+|---|---|
+| C0 recipes | all five carried recipes craft in a crafting table the way they declare: beam ×2, solar_sail ×1, beam_package ×1, solar_sail_package ×1, ray_receiver_controller ×1, each result asserted by id and count and each grid empty afterwards |
+| A wrong shape | a stone in the 3×6×3 box: the controller stayed air, 0 placeholders |
+| B formation | the **crafted** controller placed and formed 16 placeholders |
+| C readout | `sphere '83e67318-…'` — the placer's UUID — beams 0, sails 0/0, buffer 0 |
+| D ceilings | `set beams 8333334` → 50,000,000 supported; `set panels 100` → 100/50000000; `add panels 100000000` → 50,000,000; `add beams -8333333` → 1 beam / 6 sails |
+| E rate | one receiver: 100 sails, **2,000.0 FE/t** over 104 ticks |
+| F shared | a second receiver reads the **same** id; the pair's buffers grow **2,000.0 FE/t together** (two private spheres would give 4,000) |
+| F2 control | a stone roof over A: A flat, B alone at **2,000.0 FE/t**; the roof removed, A takes again |
+| G independent | sphere `keepalive-…` set to 10 beams / 60 sails leaves the receivers at 17 / 100 |
+| H night | the pair flat at t=18000, and **2,000.0 FE/t** again by day |
+| I caps | 50,000,000 sails → 1,000,000,000 FE/t, buffer stops at **100,000,000** and `down 0` |
+| J persistence | `data/horizon/attachments.dat` exists and holds the sphere id; after `save` + quit + relaunch the same id, beams and sails are back and the buffer did not regress |
+| K teardown | a broken placeholder took the controller; a broken controller left 0 placeholders |
+
+`e2e-launcher-selftest.log` — **FAIL + EXIT:1**: `SELFTEST=1` forces the rate to 1.0 and the
+run stops at `FAIL: the receiver filled at 1.0 FE/t, not 100 sails * 20`.
+`e2e-launcher-control.log` — **FAIL + EXIT:1**: the same scenario on the launcher build
+**without** the package stops at `FAIL: the beam recipe offered {"item":null,"slot":200},
+expected 2 x dysoncubeproject:beam` — the ids are unknown there, so no positive is vacuous.
+`check-e2e-logs.py dysoncubeproject-e2e --strict` → 3/3.
+
+### Coverage (parity rule)
+
+| family in the jar | state |
+|---|---|
+| 5 carried recipes | **tested** — crafted in a table (C0), output id/count and consumption asserted |
+| the ray receiver multiblock | **tested** — refused/short (A), formed (B), teardown both ways (K/K2) |
+| the receiver's energy loop | **tested** — 2,000 FE/t (E), sky gate (F2), night (H), caps (I) |
+| the shared sphere | **tested** — same id (F), one reservoir (F), independent id (G), saved across a relaunch (J) |
+| `/dysoncubeproject` commands | **tested** — all four forms by sphere id (D, E, G, I) and the readout (C) |
+| blocks and items | **tested** — the crafted controller places and reads back; the four components are given and used as ingredients |
+| the EM Rail Ejector | `not ported` — the next slice; it grows the sphere that now exists |
+| the client half (renderers, hologram, sky, GUI screens, sounds, sync packet) | `not ported` — no client half in this campaign's scope yet |
+| the subscribe/unsubscribe GUI buttons | `not ported` — the command surface sets a sphere; the buttons send the same messages |
+| the beam/sail data components | `not ported` — only the ejector reads them, and their values are 1/8 (sail/package) and 1/4 (beam/package) |
+| the 7 advancements | `not ported` — the grant loop is upstream's `publishAdvancements` |
+
+### Deviations now (and one removed)
+
+- **Removed:** "one sphere per controller". The sphere is the level's, keyed by the player's
+  UUID, as upstream's saved data has it.
+- **The store is per dimension.** `Holder::Level` is the level in place, and upstream keys
+  its saved data on the Overworld from any level. Only the Overworld generates and only the
+  Overworld's store is read there, so a receiver in the Nether reads that level's (empty)
+  store instead of the Overworld's. A receiver in the Nether could not pull anyway
+  (`Level.isDay` is false in a fixed-time level), so nothing a player can observe differs.
+- **No subscribe/unsubscribe buttons** (client half): a player gets their own sphere, and an
+  operator can change any sphere by id. The level store keeps the `subscribedPlayers` map, so
+  the buttons can be added without a save-format change.
+- **`status <pos>` is ours**, not upstream's: upstream has the GUI addon. It names the
+  sphere so the command's own id is discoverable in game.
+- The two blocks are still drawn as plain cubes (no renderers), and `blocks_motion`,
+  `isDay`, `isRaining` and the sky scan are unchanged from slice 1.
+
+### Traps this slice hit
+
+1. **A full buffer cannot show a night/day delta.** The first in-game run put the night
+   control after the caps phase and it failed at `FAIL: the receiver did not resume by day`
+   — the buffer was at 100,000,000 FE from the caps, so neither phase could move it. The
+   night control now runs before the caps.
+2. **With a shared reservoir, the receiver pair is the unit.** The day phase also failed
+   while measuring only B: A takes the tick's reservoir, so B is legitimately flat. Both the
+   sharing assertion and the night/day control now measure the **sum** of the two buffers.
+3. **A craft *can* be driven in this campaign's e2e.** `--offscreen` gives the session a
+   renderer, `ctl screen` lists the grid (100–108) and the result (200), and right-clicking
+   drops one item per cell. Slice 1's "needs a renderer" note was wrong; the five recipes are
+   now proven.
+4. **`build-slot.sh run --step check` forwards by default** and then runs in the campaign
+   copy, so `BUILD_LOCAL=1` plus an explicit `cd ports/dysoncubeproject` is the only
+   deterministic form for a local ladder; a remote `cargo fmt` writes nothing in this tree.
+5. **The attachment file is per dimension**: `saves/<world>/dimensions/minecraft/overworld/
+   data/horizon/attachments.dat` (gzipped NBT), so the e2e asserts the file and greps the
+   decompressed bytes for the sphere id before relaunching.
+
+### The package (0.2.1)
+
+`rm -f Cargo.lock && cargo horizon-mod build` → **68,932 B**, sha256
+`dbdc5aa7bb629c6caabc16b6e476493bf5170c830f13711d25e620f38c9e6b94`, **60 entries**, no
+`Cargo.lock`; a second build is byte-identical (`sdk-shas` in
+`../_shared/evidence/dysoncubeproject/sdk-{build,build-second,sha256}.*`).
+
+```
+dysoncubeproject 0.2.1 (native-mod, format native-1/0a875da91dbb0fdcb7ba8c42c11341aa229af51a/e59da9094f0c2fdda6c627fe9eff22dec6a906f0, for 26.3)
+  68932 bytes, SHA-256 dbdc5aa7bb629c6caabc16b6e476493bf5170c830f13711d25e620f38c9e6b94, unsigned
+```
+
+```
+Dyson Cube Project:
+0a875da  made for
+```
+```
+Dyson Cube Project:
+0b14f8a  fits
+```
+
+`verify-sdk-package.py dysoncubeproject` → **1/1** (package, runtime byte-identical in tree
+and pack, 57 tests, 0 clippy warnings, check, fits, `Skills:` line).
+
+### Changelog (0.2.1)
+
+> **0.2.1 — the shared per-player sphere.** The sphere is no longer one per controller: the
+> level keeps every sphere and its subscriptions (the same shape as upstream's
+> `DysonSphereProgressSavedData`), saved in the dimension's `data/horizon/attachments.dat`,
+> and each receiver draws from the sphere its placer subscribed to — several receivers share
+> one reservoir, and the tick generates for every sphere once (`level_tick_pre`, Overworld).
+> `/dysoncubeproject set|add beams|panels` take a sphere id again, as upstream's commands do,
+> and `status` names the sphere it reads. `SELFTEST=1` and the control run are the
+> fail-capable legs; all five carried recipes are now crafted in game. Known gaps unchanged
+> in kind: the EM Rail Ejector (next), the client half and its sync packet, the growth
+> advancements, the component payloads.
 
 Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-port
